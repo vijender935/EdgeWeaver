@@ -14,8 +14,8 @@
  * Connect clients to: https://cloudflare-mcp.<your-subdomain>.workers.dev/mcp
  */
 
-import { createLegacyMcpHandler } from "agents/mcp";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { createMcpHandler } from "agents/mcp/server";
+import { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
 
 export interface Env {
@@ -106,7 +106,7 @@ function createServer(env: Env) {
 
   const worker = env.AI_IMAGES;
 
-  server.tool(
+  server.registerTool(
     "health",
     "Check health / status of the ai-images-pilot Worker and its bindings (AI, DB, R2, Vectorize).",
     {},
@@ -118,7 +118,7 @@ function createServer(env: Env) {
     }
   );
 
-  server.tool(
+  server.registerTool(
     "list_images",
     "List images from the D1 catalog. Supports limit, offset and optional status filter (pending|processing|ready|error).",
     {
@@ -154,7 +154,7 @@ function createServer(env: Env) {
     }
   );
 
-  server.tool(
+  server.registerTool(
     "search_images",
     "Semantic search over the image catalog using Vectorize + D1 enrichment. Provide a natural language query.",
     {
@@ -178,7 +178,7 @@ function createServer(env: Env) {
     }
   );
 
-  server.tool(
+  server.registerTool(
     "process_image",
     "Process an image: describe it with Llama 3.2 Vision, embed the description, store in Vectorize + D1. Pass an R2 key or leave empty to auto-pick a pending image.",
     {
@@ -205,7 +205,7 @@ function createServer(env: Env) {
     }
   );
 
-  server.tool(
+  server.registerTool(
     "get_image",
     "Retrieve an image from the private ai-images R2 bucket and return it as MCP image content. Pass the exact R2 object key from search_images or list_r2_objects.",
     {
@@ -238,7 +238,7 @@ function createServer(env: Env) {
     }
   );
 
-  server.tool(
+  server.registerTool(
     "list_r2_objects",
     "List raw objects currently stored in the ai-images R2 bucket (helper for discovering unprocessed images).",
     {},
@@ -257,7 +257,6 @@ export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext) {
     // Create a fresh server instance per request so tools close over the correct env
     const server = createServer(env);
-    const handler = createLegacyMcpHandler(server);
-    return handler(request, env, ctx);
+    return createMcpHandler(() => createServer(env), { responseMode: "json" })(request, env, ctx);
   },
 };
