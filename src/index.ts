@@ -256,7 +256,6 @@ function createServer(env: Env) {
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext) {
     // Create a fresh server instance per request so tools close over the correct env
-    const server = createServer(env);
     return createMcpHandler(() => createServer(env), { responseMode: "json" })(request, env, ctx);
   },
 };
