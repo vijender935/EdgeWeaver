@@ -8,7 +8,7 @@
  *  - search_images   → GET /search?q=
  *  - process_image   → POST /process
  *  - list_r2_objects → GET /r2
- *  - get_image       → GET /image?key=
+ *  - get_image       → returns public URL from ai-images-serve
  *
  * Deploy: npm run deploy
  * Connect clients to: https://cloudflare-mcp.<your-subdomain>.workers.dev/mcp
@@ -22,6 +22,8 @@ export interface Env {
   /** Cloudflare Service Binding to the ai-images-pilot Worker. */
   AI_IMAGES: Fetcher;
 }
+
+const PUBLIC_IMAGE_BASE = "https://ai-images-serve.vijender935.workers.dev/image";
 
 /**
  * Helper: call the upstream ai-images-pilot Worker through a Cloudflare
@@ -62,46 +64,10 @@ async function callWorker(
   return data;
 }
 
-async function callWorkerImage(
-  worker: Fetcher,
-  path: string
-): Promise<{ data: string; mimeType: string }> {
-  const normalizedPath = path.startsWith("/") ? path : `/${path}`;
-  const request = new Request(`https://ai-images-pilot.internal${normalizedPath}`);
-  const res = await worker.fetch(request);
-
-  if (!res.ok) {
-    const errorText = await res.text();
-    let message = errorText;
-    try {
-      const errorData = JSON.parse(errorText);
-      message = errorData?.error || errorText;
-    } catch {}
-    throw new Error(
-      `Worker responded ${res.status}: ${message || res.statusText}`
-    );
-  }
-
-  const contentType =
-    res.headers.get("Content-Type") || "application/octet-stream";
-  const bytes = new Uint8Array(await res.arrayBuffer());
-
-  let binary = "";
-  const chunkSize = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunkSize) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
-  }
-
-  return {
-    data: btoa(binary),
-    mimeType: contentType.split(";")[0].trim(),
-  };
-}
-
 function createServer(env: Env) {
   const server = new McpServer({
     name: "cloudflare-mcp",
-    version: "1.0.0",
+    version: "1.1.0",
   });
 
   const worker = env.AI_IMAGES;
@@ -221,7 +187,7 @@ function createServer(env: Env) {
     "get_image",
     {
       description:
-        "Retrieve an image from the private ai-images R2 bucket and return it as MCP image content. Pass the exact R2 object key from search_images or list_r2_objects.",
+        "Get a public URL for an image stored in the private ai-images R2 bucket. Pass the exact R2 object key from search_images or list_r2_objects. Returns a direct image URL that chat clients can render.",
       inputSchema: {
         key: z
           .string()
@@ -230,23 +196,19 @@ function createServer(env: Env) {
       },
     },
     async ({ key }) => {
-      const params = new URLSearchParams({ key });
-      const image = await callWorkerImage(worker, `/image?${params.toString()}`);
+      // Prefer public URL so Grok / Gemini / other clients can render the image
+      // instead of trying to handle large base64 payloads in MCP content.
+      const url = `${PUBLIC_IMAGE_BASE}?key=${encodeURIComponent(key)}`;
 
       return {
         content: [
           {
-            type: "image",
-            data: image.data,
-            mimeType: image.mimeType,
+            type: "text",
+            text: url,
           },
           {
             type: "text",
-            text: JSON.stringify(
-              { key, mimeType: image.mimeType },
-              null,
-              2
-            ),
+            text: JSON.stringify({ key, url, mimeType: "image/jpeg" }, null, 2),
           },
         ],
       };
@@ -274,7 +236,6 @@ function createServer(env: Env) {
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext) {
     // Create a fresh server instance per request so tools close over the correct env
-    // Removed responseMode: "json" — it was breaking image content rendering in clients (Grok/Gemini)
     return createMcpHandler(() => createServer(env))(request, env, ctx);
   },
 };
