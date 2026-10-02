@@ -8,7 +8,7 @@
  *  - search_images   → GET /search?q=
  *  - process_image   → POST /process
  *  - list_r2_objects → GET /r2
- *  - get_image       → returns public URL from ai-images-serve
+ *  - get_image       → hybrid: base64 (if small) + public URL (full quality)
  *
  * Deploy: npm run deploy
  * Connect clients to: https://cloudflare-mcp.<your-subdomain>.workers.dev/mcp
@@ -24,6 +24,9 @@ export interface Env {
 }
 
 const PUBLIC_IMAGE_BASE = "https://ai-images-serve.vijender935.workers.dev/image";
+
+/** Max raw bytes for returning base64 image content (keeps MCP payload reasonable). */
+const MAX_BASE64_BYTES = 280_000;
 
 /**
  * Helper: call the upstream ai-images-pilot Worker through a Cloudflare
@@ -64,10 +67,43 @@ async function callWorker(
   return data;
 }
 
+async function fetchImageBinary(
+  worker: Fetcher,
+  key: string
+): Promise<{ bytes: Uint8Array; mimeType: string; size: number } | null> {
+  const params = new URLSearchParams({ key });
+  const request = new Request(
+    `https://ai-images-pilot.internal/image?${params.toString()}`
+  );
+  const res = await worker.fetch(request);
+
+  if (!res.ok) return null;
+
+  const contentType =
+    res.headers.get("Content-Type") || "application/octet-stream";
+  const buffer = await res.arrayBuffer();
+  const bytes = new Uint8Array(buffer);
+
+  return {
+    bytes,
+    mimeType: contentType.split(";")[0].trim(),
+    size: bytes.length,
+  };
+}
+
+function toBase64(bytes: Uint8Array): string {
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+  }
+  return btoa(binary);
+}
+
 function createServer(env: Env) {
   const server = new McpServer({
     name: "cloudflare-mcp",
-    version: "1.1.0",
+    version: "1.2.0",
   });
 
   const worker = env.AI_IMAGES;
@@ -187,7 +223,7 @@ function createServer(env: Env) {
     "get_image",
     {
       description:
-        "Get a public URL for an image stored in the private ai-images R2 bucket. Pass the exact R2 object key from search_images or list_r2_objects. Returns a direct image URL that chat clients can render.",
+        "Hybrid image retrieval. Returns a public full-quality URL always. For images under ~280KB also returns MCP image content (base64) so clients can show it directly. Pass the exact R2 object key from search_images or list_r2_objects.",
       inputSchema: {
         key: z
           .string()
@@ -196,22 +232,46 @@ function createServer(env: Env) {
       },
     },
     async ({ key }) => {
-      // Prefer public URL so Grok / Gemini / other clients can render the image
-      // instead of trying to handle large base64 payloads in MCP content.
       const url = `${PUBLIC_IMAGE_BASE}?key=${encodeURIComponent(key)}`;
 
-      return {
-        content: [
+      const image = await fetchImageBinary(worker, key);
+
+      const content: Array<
+        | { type: "image"; data: string; mimeType: string }
+        | { type: "text"; text: string }
+      > = [];
+
+      // Direct base64 only when payload stays reasonable (preserves original quality)
+      if (image && image.size <= MAX_BASE64_BYTES) {
+        content.push({
+          type: "image",
+          data: toBase64(image.bytes),
+          mimeType: image.mimeType,
+        });
+      }
+
+      // Always provide the full-quality public URL
+      content.push({
+        type: "text",
+        text: url,
+      });
+
+      content.push({
+        type: "text",
+        text: JSON.stringify(
           {
-            type: "text",
-            text: url,
+            key,
+            url,
+            mimeType: image?.mimeType || "image/jpeg",
+            size_bytes: image?.size ?? null,
+            base64_included: !!(image && image.size <= MAX_BASE64_BYTES),
           },
-          {
-            type: "text",
-            text: JSON.stringify({ key, url, mimeType: "image/jpeg" }, null, 2),
-          },
-        ],
-      };
+          null,
+          2
+        ),
+      });
+
+      return { content };
     }
   );
 
