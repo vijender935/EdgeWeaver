@@ -8,7 +8,7 @@
  *  - search_images   → GET /search?q=
  *  - process_image   → POST /process
  *  - list_r2_objects → GET /r2
- *  - get_image       → hybrid: base64 (if small) + public URL (full quality)
+ *  - get_image       → base64 image (direct) when small, else public URL
  *
  * Deploy: npm run deploy
  * Connect clients to: https://cloudflare-mcp.<your-subdomain>.workers.dev/mcp
@@ -103,7 +103,7 @@ function toBase64(bytes: Uint8Array): string {
 function createServer(env: Env) {
   const server = new McpServer({
     name: "cloudflare-mcp",
-    version: "1.2.0",
+    version: "1.3.0",
   });
 
   const worker = env.AI_IMAGES;
@@ -223,7 +223,7 @@ function createServer(env: Env) {
     "get_image",
     {
       description:
-        "Hybrid image retrieval. Returns a public full-quality URL always. For images under ~280KB also returns MCP image content (base64) so clients can show it directly. Pass the exact R2 object key from search_images or list_r2_objects.",
+        "Return image for direct preview. Small images (≤~280KB) are returned as MCP image content (base64) for inline display. Larger images return a public full-quality URL. Pass the exact R2 object key from search_images or list_r2_objects.",
       inputSchema: {
         key: z
           .string()
@@ -232,46 +232,56 @@ function createServer(env: Env) {
       },
     },
     async ({ key }) => {
-      const url = `${PUBLIC_IMAGE_BASE}?key=${encodeURIComponent(key)}`;
-
       const image = await fetchImageBinary(worker, key);
 
-      const content: Array<
-        | { type: "image"; data: string; mimeType: string }
-        | { type: "text"; text: string }
-      > = [];
-
-      // Direct base64 only when payload stays reasonable (preserves original quality)
-      if (image && image.size <= MAX_BASE64_BYTES) {
-        content.push({
-          type: "image",
-          data: toBase64(image.bytes),
-          mimeType: image.mimeType,
-        });
+      if (!image) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({ error: "Image not found", key }, null, 2),
+            },
+          ],
+        };
       }
 
-      // Always provide the full-quality public URL
-      content.push({
-        type: "text",
-        text: url,
-      });
+      // Prefer pure image content so clients can render direct preview
+      if (image.size <= MAX_BASE64_BYTES) {
+        return {
+          content: [
+            {
+              type: "image",
+              data: toBase64(image.bytes),
+              mimeType: image.mimeType,
+            },
+          ],
+        };
+      }
 
-      content.push({
-        type: "text",
-        text: JSON.stringify(
+      // Fallback for large images: public URL (full original quality)
+      const url = `${PUBLIC_IMAGE_BASE}?key=${encodeURIComponent(key)}`;
+      return {
+        content: [
           {
-            key,
-            url,
-            mimeType: image?.mimeType || "image/jpeg",
-            size_bytes: image?.size ?? null,
-            base64_included: !!(image && image.size <= MAX_BASE64_BYTES),
+            type: "text",
+            text: url,
           },
-          null,
-          2
-        ),
-      });
-
-      return { content };
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                key,
+                url,
+                mimeType: image.mimeType,
+                size_bytes: image.size,
+                note: "Image too large for base64; use URL for full quality",
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
     }
   );
 
